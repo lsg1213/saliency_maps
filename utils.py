@@ -5,6 +5,15 @@ import numpy as np
 EPSILON = 1e-8
 LOG_EPSILON = np.log(EPSILON)
 
+def normalize_spec(x, norm=False, chan=(0, 1)):
+    x = x.copy()
+    x[:, :, :, chan] = np.log(x[:, :, :, chan] + EPSILON)
+
+    # normalize...
+    if norm:
+        print("\nMean: {}, Std: {}\n".format(x.mean(axis=(0,1,2)), x.std(axis=(0,1,2))))
+        x = x / (x.std(axis=(0,1,2), keepdims=True)+1e-8) - x.mean(axis=(0,1,2), keepdims=True)
+    return x
 
 def sequence_to_windows(sequence, 
                         pad_size, 
@@ -80,7 +89,6 @@ def preprocess_spec(config, feature='mel', skip=1):
         return windows
     return _preprocess_spec
 
-
 # TODO (test is required)
 def label_to_window(config, skip=1):
     def _preprocess_label(label):
@@ -88,4 +96,3 @@ def label_to_window(config, skip=1):
             label, config.pad_size, config.step_size, skip, True)
         return label
     return _preprocess_label
-

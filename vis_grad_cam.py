@@ -1,37 +1,37 @@
 class arg():
     gpus = '-1'
-    model = 'st_attention'
+    model = 'challenge'
     pad_size = 19
     step_size = 9
     feature = 'mel'
     skip = 1
-    dataset = 'noisex'
     norm = False
     noise_aug = False
     voice_aug = False
     aug = False
     snr = ['0']
-    layer = 20
+    layer = -4
     algorithm = 'cam'
-    class_index = 1
-    before_softmax = -2
-    dataset = 'noisex'
-    window = True
+    class_index = 4
+    before_softmax = -1
+    dataset = 'challenge'
+    window = False
 config = arg()
-if config.model == 'st_attention':
+if config.model == 'challenge':
+    config.before_softmax = -1
+elif config.model == 'st_attention':
     config.before_softmax = -2
 elif config.model == 'bdnn':
     config.before_softmax = -2
-
 from tensorflow.python.framework.ops import disable_eager_execution, enable_eager_execution
 
 import pickle, scipy, os
 import numpy as np
 import tensorflow as tf
 from tqdm import tqdm
-from utils import preprocess_spec
+from utils import preprocess_spec, normalize_spec
 os.environ['CUDA_VISIBLE_DEVICES'] = config.gpus
-
+import pdb
 
 def sequence_to_windows(sequence, 
                         pad_size, 
@@ -91,12 +91,10 @@ def windows_to_sequence(windows,
     
     return sequence
 
-def image_resize(image, size=(7,80)):
-    return tf.image.resize(image, size)
+
 
 # @tf.function
 def multipling(inputs):
-    # import pdb; pdb.set_trace()
     conv, weights = inputs
     # weights = tf.expand_dims(weights,0)
     grad_cam = conv * weights
@@ -104,24 +102,26 @@ def multipling(inputs):
     return grad_cam
 
 # @tf.function
-def generate_grad_cam(model,data,class_idx,new_model):
+def generate_grad_cam(model,data,class_idx,new_model, y_model):
     # data = (sound time, window, seq)
     img_tensor = tf.convert_to_tensor(data)
 
     # class index별 나눠서 진행하는 것 전처리
     masking = np.zeros(data.shape[1])
     ones = np.array([1])
-
     def get_grad_val(inputs):
         with tf.GradientTape() as y_tape:
             y_tape.watch(img_tensor)
             y_c = y_model(img_tensor, training=False)
+            class_mask = tf.one_hot(class_idx, y_c.shape[-1])
+            if tf.rank(y_c) == 2:
+                class_mask = class_mask[tf.newaxis, ...]
+            y_c = y_c * class_mask
         y_c_grad = y_tape.gradient(y_c, img_tensor)
         with tf.GradientTape() as A_tape:
             A_tape.watch(img_tensor)
             A_k = new_model(img_tensor, training=False)
         A_k_grad = A_tape.gradient(A_k, img_tensor)
-
         return y_c_grad / A_k_grad, A_k
     
     def get_grad_val_window(inputs):
@@ -158,28 +158,52 @@ def generate_grad_cam(model,data,class_idx,new_model):
     else:
         grad_val, conv_output = get_grad_val(img_tensor)
     #----------------------------------------------------------
-
+    if grad_val.shape[0] == 1:
+        grad_val = tf.squeeze(grad_val, axis=0)
+    if conv_output.shape[0] == 1:
+        conv_output = tf.squeeze(conv_output, axis=0)
+    
+    def image_resize(image, size=(data.shape[0], data.shape[1])):
+        return tf.image.resize(image, size)
     if len(grad_val.shape) == 3:
-        axis = (1,2)
+        axis = (0,1)
+        weights = tf.keras.backend.mean(tf.cast(grad_val, tf.float32), axis=axis)
+        # 음성 길이, 모델 출력 channel
+        for i in range(4-tf.rank(conv_output)):
+            conv_output = conv_output[..., tf.newaxis]
+        # conv_output = (time, 7, 10, 128), weights = (time,)
+        cam = tf.map_fn(multipling, (conv_output, weights), dtype='float32')
+        # cam = (time, 7, 10)
+        
+        cam = cam[..., tf.newaxis]
+        cam = tf.map_fn(image_resize, cam)
+
+        ## Relu
+        cam = tf.keras.activations.relu(cam)
+        cam = (cam + tf.keras.backend.abs(cam)) / 2
+        cam = tf.math.divide_no_nan(tf.squeeze(cam, -1), tf.keras.backend.max(cam,axis=-1))
+    
+        return cam
+    elif len(grad_val.shape) == 4:
+        # if tf.rank(grad_val) == tf.rank(conv_output) == 4:
+        #     grad_val = tf.squeeze(grad_val, axis=0)
+        #     conv_output = tf.squeeze(conv_output, axis=0)
+        axis = (1,2,3)
+        weights = tf.keras.backend.mean(tf.cast(grad_val, tf.float32), axis=axis)
+
+        cam = weights * tf.math.reduce_sum(grad_val,-1)
+        if cam.shape[0] == 1:
+            cam = tf.squeeze(cam, axis=0)
+        if tf.rank(cam) == 2:
+            cam = cam[...,tf.newaxis]
+        cam = tf.image.resize(cam, data.shape[1:3])
+        cam = tf.keras.activations.relu(cam)
+        cam = (cam + tf.keras.backend.abs(cam)) / 2
+        cam = tf.math.divide_no_nan(cam, tf.keras.backend.max(cam))
+        return cam
     else:
         raise ValueError(f'grad_val shape is {grad_val.shape}')
-    weights = tf.keras.backend.mean(tf.cast(grad_val, tf.float32), axis=axis)
-    # 음성 길이, 모델 출력 channel
-    for i in range(4-tf.rank(conv_output)):
-        conv_output = conv_output[..., tf.newaxis]
-    # conv_output = (time, 7, 10, 128), weights = (time,)
-    cam = tf.map_fn(multipling, (conv_output, weights), dtype='float32')
-    # cam = (time, 7, 10)
     
-    cam = cam[..., tf.newaxis]
-    cam = tf.map_fn(image_resize, cam)
-
-    ## Relu
-    cam = tf.keras.activations.relu(cam)
-    
-    cam = tf.math.divide_no_nan(tf.squeeze(cam, -1), tf.keras.backend.max(cam,axis=-1))
- 
-    return cam
 
 def gradient_saliency(model, data):
     data = tf.convert_to_tensor(data)
@@ -188,8 +212,7 @@ def gradient_saliency(model, data):
         y = model(data)
     return tape.gradient(y, data).numpy()
 
-if __name__ == '__main__':
-
+def main(config):
     ## 2. image sources
     x, y = None, None
     if config.dataset == 'noisex':
@@ -203,16 +226,19 @@ if __name__ == '__main__':
         if not os.path.isdir(data_path): # outside... 
             data_path = '/media/data1/datasets/ai_challenge/'
 
-        x = np.load(os.path.join(data_path, 't3_audio.npy'))
+        # x = np.load(os.path.join(data_path, 't3_audio.npy'))
+        # x = pickle.load(open(data_path+'/final_x.pickle','rb'))
+        x = pickle.load(open(data_path+'/test_final_x.pickle','rb'))
+        x = normalize_spec(x, norm=config.norm)
+
         """ DATA """
         # 2. DATA PRE-PROCESSING
-        x = list(map(preprocess_spec(config, skip=config.skip), x))[:5]
         print("data pre-processing finished")
         
     
     
     if config.dataset == 'challenge':
-        H5_PATH = './st_model.h5'
+        H5_PATH = '/root/RDChallenge/window/the_model.h5'
         config.model = 'challenge'
         config.window = False
     else:
@@ -221,6 +247,7 @@ if __name__ == '__main__':
 
     model = tf.keras.models.load_model(H5_PATH, compile=False)
     model.summary()
+    exit()
     new_model = tf.keras.models.Model(
         inputs=model.input, 
         outputs=model.layers[config.layer].output)
@@ -230,34 +257,39 @@ if __name__ == '__main__':
 
     k = 0
     maps = []
-    for s in tqdm(x):
-        img = np.zeros((s.shape[0], s.shape[-1]))
-        cam = np.zeros((s.shape[0], s.shape[-1]))
-        tmp_cam = np.zeros_like(s)
-        y_c = new_model(s, training=False)
+    for _x in tqdm(x):
+        if tf.rank(_x) == tf.rank(model.input) - 1:
+            _x = _x[tf.newaxis,...]
+        img = np.zeros((_x.shape[0], _x.shape[-1]))
+        cam = np.zeros((_x.shape[0], _x.shape[-1]))
+        tmp_cam = np.zeros_like(_x)
+        y_c = new_model(_x, training=False)
         if config.algorithm == 'cam':
             ### grad-cam code ###
-            _cam = generate_grad_cam(model, s, class_idx, new_model)
+            _cam = generate_grad_cam(model, _x, class_idx, new_model, y_model)
             # for i, j in enumerate(s):
             #     _cam = _generate_grad_cam(np.expand_dims(j, 0),model, class_idx, config.layer)
             #     tmp_cam[i] = np.expand_dims(_cam.T, 0)
+            if config.model != 'challenge':
+                _img = _x
+                if _cam.shape[-1] != 80:
+                    _cam = tf.transpose(_cam, [0,2,1])
+                if _img.shape[-1] != 80:
+                    _img = np.transpose(_x, [0,2,1])
 
-            _img = s
-            if _cam.shape[-1] != 80:
-                _cam = tf.transpose(_cam, [0,2,1]  )
-            if _img.shape[-1] != 80:
-                _img = np.transpose(s, [0,2,1])
-
-            cam = windows_to_sequence(_cam, config.pad_size, config.step_size)
-            img = windows_to_sequence(_img, config.pad_size, config.step_size)
+                cam = windows_to_sequence(_cam, config.pad_size, config.step_size)
+                img = windows_to_sequence(_img, config.pad_size, config.step_size)
+            else:
+                img = _x
+                cam = _cam.numpy()
             #####################
 
         # print(np.array(cam).shape, np.array(img).shape)
         elif config.algorithm == 'sal':
             ### saliency code ###
-            cam = gradient_saliency(tf.keras.Model(inputs=model.input,outputs=model.layers[config.layer].output), s)
+            cam = gradient_saliency(tf.keras.Model(inputs=model.input,outputs=model.layers[config.layer].output), _x)
             cam = windows_to_sequence(cam, config.pad_size, config.step_size)
-            img = windows_to_sequence(s, config.pad_size, config.step_size)
+            img = windows_to_sequence(_x, config.pad_size, config.step_size)
             #####################
         maps.append([img,cam])
     print('process done, save data')
@@ -267,6 +299,11 @@ if __name__ == '__main__':
     
     if config.algorithm == 'sal':
         name = name[5:]
-    pickle.dump(maps, open(name, 'wb'))
+    pickle.dump(maps, open(name+'.pickle', 'wb'))
     print(name)
     print(model.layers[config.layer].name)
+
+if __name__ == '__main__':
+    for i in range(0,11):
+        config.class_index = i
+        main(config)
